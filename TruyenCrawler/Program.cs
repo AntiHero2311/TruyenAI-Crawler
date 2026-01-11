@@ -47,16 +47,24 @@ class Program
             Console.WriteLine("   ROYAL ROAD CRAWLER (RAG / AI TRAIN)   ");
             Console.WriteLine("==============================================");
             Console.WriteLine("1. Cào dữ liệu truyện RoyalRoad");
-            Console.WriteLine("2. Thoát");
+            Console.WriteLine("2. Embering data gemini");
+            Console.WriteLine("3. Thoát");
             Console.Write("👉 Chọn (1-2): ");
             Console.ResetColor();
 
             var choice = Console.ReadLine();
             if (choice == "1")
                 await RunRoyalRoadCrawler();
-            else if (choice == "2")
+            else if (choice == "3")
                 return;
+            else if (choice == "2") // Tạo Vector DB
+            {
+                string apiKey = config["GeminiSettings:ApiKey"];
+                var processor = new VectorProcessor(database, apiKey);
+                await processor.ProcessAllData();
+            }
             else
+
                 Console.WriteLine("⚠️ Lựa chọn không hợp lệ.\n");
         }
     }
