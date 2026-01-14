@@ -3,6 +3,7 @@ using Microsoft.Extensions.Configuration;
 using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Diagnostics;
+using System.Globalization; // Fix lỗi số 2.5
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -13,14 +14,13 @@ class Program
     static IConfigurationRoot config;
 
     static object _consoleLock = new object();
-
-    const int MAX_PARALLEL_REQUESTS = 5;
+    const int MAX_PARALLEL_REQUESTS = 3; // Giữ mức an toàn để không bị chặn
 
     static async Task Main(string[] args)
     {
         Console.OutputEncoding = Encoding.UTF8;
 
-        // 1️⃣ Kết nối MongoDB
+        // 1️⃣ KẾT NỐI MONGODB
         try
         {
             config = new ConfigurationBuilder()
@@ -39,70 +39,77 @@ class Program
             return;
         }
 
-        // 2️⃣ Menu chính
+        // 2️⃣ MENU CHÍNH
         while (true)
         {
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("==============================================");
-            Console.WriteLine("   ROYAL ROAD CRAWLER (RAG / AI TRAIN)   ");
+            Console.WriteLine("   ROYAL ROAD CRAWLER (FINAL VERSION 10/10)   ");
             Console.WriteLine("==============================================");
-            Console.WriteLine("1. Cào dữ liệu truyện RoyalRoad");
-            Console.WriteLine("2. Embering data gemini");
-            Console.WriteLine("3. Thoát");
+            Console.WriteLine("1. Cào dữ liệu (Info -> Review -> Chapter -> Comment)");
+            Console.WriteLine("2. Thoát");
             Console.Write("👉 Chọn (1-2): ");
             Console.ResetColor();
 
             var choice = Console.ReadLine();
-            if (choice == "1")
-                await RunRoyalRoadCrawler();
-            else if (choice == "3")
-                return;
-            else if (choice == "2") // Tạo Vector DB
-            {
-                string apiKey = config["GeminiSettings:ApiKey"];
-                var processor = new VectorProcessor(database, apiKey);
-                await processor.ProcessAllData();
-            }
-            else
-
-                Console.WriteLine("⚠️ Lựa chọn không hợp lệ.\n");
+            if (choice == "1") await RunRoyalRoadCrawler();
+            else if (choice == "2") return;
         }
     }
 
-    // ================================
-    // 🕸️ CÀO TRUYỆN ROYALROAD
-    // ================================
+    // =========================================================
+    // 🕸️ MAIN FUNCTION: ĐIỀU PHỐI CHƯƠNG TRÌNH
+    // =========================================================
     static async Task RunRoyalRoadCrawler()
     {
         var booksCol = database.GetCollection<BsonDocument>("EnglishBooks");
         var chaptersCol = database.GetCollection<BsonDocument>("EnglishChapters");
-        var commentsCol = database.GetCollection<BsonDocument>("EnglishComments");
+        var reviewsCol = database.GetCollection<BsonDocument>("EnglishReview");   // Review Truyện
+        var commentsCol = database.GetCollection<BsonDocument>("EnglishComment"); // Comment Chương
 
         Console.Write("📚 Nhập link mục lục truyện: ");
         string tocUrl = Console.ReadLine()?.Trim();
         if (string.IsNullOrEmpty(tocUrl)) return;
 
-        Console.WriteLine("🔍 Đang lấy thông tin truyện...");
-
+        // --- 1. LẤY THÔNG TIN CƠ BẢN ---
+        Console.WriteLine("🔍 Đang lấy thông tin cơ bản...");
         var (title, author, genres, chapterLinks) = await GetStoryInfo(tocUrl);
+
         if (chapterLinks.Count == 0)
         {
-            Console.WriteLine("❌ Không tìm thấy chương nào.");
+            Console.WriteLine("❌ Không tìm thấy chương nào hoặc link sai.");
             return;
         }
 
-        // Hiển thị thông tin
+        // --- 2. LẤY STATS ---
+        Console.WriteLine("📊 Đang phân tích Statistics...");
+        BsonDocument stats = new BsonDocument();
+        try
+        {
+            using (var client = new HttpClient())
+            {
+                client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
+                string html = await client.GetStringAsync(tocUrl);
+                var doc = new HtmlDocument();
+                doc.LoadHtml(html);
+                stats = GetStoryStatistics(doc);
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"⚠️ Lỗi Stats: {ex.Message}"); }
+
+        // --- 3. LƯU BOOKS ---
+        title = System.Net.WebUtility.HtmlDecode(title);
+
         Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"\n📖 Tên truyện: {title}");
+        Console.WriteLine($"\n📖 Truyện: {title}");
         Console.WriteLine($"✍️  Tác giả: {author}");
-        Console.WriteLine($"🏷️  Thể loại: {string.Join(", ", genres)}");
+        Console.WriteLine($"📈 Followers: {stats.GetValue("followers", 0)}");
         Console.WriteLine($"📚 Số chương: {chapterLinks.Count}");
-        Console.WriteLine($"🔗 Nguồn: {tocUrl}\n");
         Console.ResetColor();
 
-        // --- Lưu / kiểm tra truyện ---
         var existing = await booksCol.Find(Builders<BsonDocument>.Filter.Eq("title", title)).FirstOrDefaultAsync();
         ObjectId storyId;
+
         if (existing == null)
         {
             var doc = new BsonDocument
@@ -110,277 +117,297 @@ class Program
                 { "title", title },
                 { "author", author },
                 { "genres", new BsonArray(genres) },
+                { "statistics", stats },
                 { "url", tocUrl },
                 { "source", "RoyalRoad" },
                 { "created_at", DateTime.UtcNow }
             };
             await booksCol.InsertOneAsync(doc);
             storyId = doc["_id"].AsObjectId;
-            Console.WriteLine($"✅ Đã thêm truyện mới: {title}\n");
+            Console.WriteLine($"✅ Đã tạo mới truyện trong EnglishBooks.\n");
         }
         else
         {
             storyId = existing["_id"].AsObjectId;
-            Console.WriteLine($"⚠️ Truyện đã tồn tại: {title}\n");
+            var update = Builders<BsonDocument>.Update
+                .Set("statistics", stats)
+                .Set("updated_at", DateTime.UtcNow);
+            await booksCol.UpdateOneAsync(Builders<BsonDocument>.Filter.Eq("_id", storyId), update);
+            Console.WriteLine($"🔄 Đã cập nhật thống kê truyện.\n");
         }
-        await ScrapeStoryReviews(tocUrl, storyId, commentsCol);
-        // --- Cào các chương ---
+
+        // --- 4. CÀO REVIEW TRUYỆN (Vào EnglishReview) ---
+        await ScrapeStoryReviews(tocUrl, storyId, reviewsCol);
+
+        // --- 5. CÀO NỘI DUNG & COMMENT CHƯƠNG ---
         var semaphore = new SemaphoreSlim(MAX_PARALLEL_REQUESTS);
         int done = 0;
         int total = chapterLinks.Count;
         var sw = Stopwatch.StartNew();
 
-        Console.WriteLine("\n🚀 Đang tải chương...");
-
+        Console.WriteLine("\n🚀 Đang tải Chương & Comment (Max 7 cmt/chương)...");
         var tasks = new List<Task>();
 
-        foreach(var link in chapterLinks)
+        foreach (var link in chapterLinks)
         {
             await semaphore.WaitAsync();
             tasks.Add(Task.Run(async () =>
             {
                 try
                 {
-                    await ProcessChapter(link, storyId, chaptersCol);
+                    await ProcessChapter(link, storyId, chaptersCol, commentsCol);
                 }
                 finally
                 {
-                    // 1. Tăng biến đếm an toàn
                     int currentCount = Interlocked.Increment(ref done);
-
-                    // 2. Khóa màn hình để chỉ 1 luồng được viết tại 1 thời điểm
                     lock (_consoleLock)
                     {
                         double percent = (double)currentCount / total * 100;
                         Console.Write($"\r⏳ Tiến độ: {currentCount}/{total} ({percent:F1}%)".PadRight(40));
                     }
-
                     semaphore.Release();
                 }
             }));
         }
 
-        // Chờ tất cả các luồng chạy xong hẳn rồi mới báo hoàn tất
         await Task.WhenAll(tasks);
-
         sw.Stop();
-        Console.WriteLine($"\n\n🎉 Hoàn tất truyện trong {sw.Elapsed.TotalSeconds:F1}s\n");
+        Console.WriteLine($"\n\n🎉 Hoàn tất toàn bộ trong {sw.Elapsed.TotalSeconds:F1}s\n");
     }
 
-    // ================================
-    // 📘 LẤY THÔNG TIN TRUYỆN
-    // ================================
-    static async Task<(string Title, string Author, List<string> Genres, List<string> Links)>
-        GetStoryInfo(string tocUrl)
+    // =========================================================
+    // 📄 HÀM XỬ LÝ CHƯƠNG + GỌI CÀO COMMENT
+    // =========================================================
+    static async Task ProcessChapter(string url, ObjectId storyId, IMongoCollection<BsonDocument> chaptersCol, IMongoCollection<BsonDocument> commentsCol)
     {
-        string title = "Unknown";
-        string author = "Unknown";
-        var genres = new List<string>();
-        var links = new List<string>();
-
         using var client = new HttpClient();
         client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
 
-        string html = await client.GetStringAsync(tocUrl);
-        var doc = new HtmlDocument();
-        doc.LoadHtml(html);
-
-        // Lấy tên truyện
-        title = doc.DocumentNode.SelectSingleNode("//h1")?.InnerText.Trim() ?? "Unknown";
-
-        // Lấy tên tác giả
-        var authorNode = doc.DocumentNode.SelectSingleNode("//h4//a[contains(@href, '/profile/')]");
-
-        if (authorNode != null)
-        {
-            author = authorNode.InnerText.Trim();
-        }
-        else
-        {
-            var metaAuthor = doc.DocumentNode.SelectSingleNode("//meta[@property='books:author']");
-            if (metaAuthor != null)
-            {
-                author = metaAuthor.GetAttributeValue("content", "Unknown");
-            }
-            else
-            {
-                var metaAuthor2 = doc.DocumentNode.SelectSingleNode("//meta[@name='author']");
-                if (metaAuthor2 != null) author = metaAuthor2.GetAttributeValue("content", "Unknown");
-            }
-        }
-
-        // Lấy thể loại
-        var genreNodes = doc.DocumentNode.SelectNodes("//span[contains(@class, 'tags')]//a");
-        if (genreNodes != null)
-            genres.AddRange(genreNodes.Select(g => g.InnerText.Trim()));
-
-        // Lấy link chương
-        var linkNodes = doc.DocumentNode.SelectNodes("//table[@id='chapters']//td[1]/a[@href]");
-        if (linkNodes != null)
-        {
-            foreach (var node in linkNodes)
-            {
-                string href = node.GetAttributeValue("href", "");
-                if (!href.StartsWith("http")) href = "https://www.royalroad.com" + href;
-                if (href.Contains("chapter")) links.Add(href);
-            }
-        }
-
-        return (title, author, genres.Distinct().ToList(), links.Distinct().ToList());
-    }
-
-    // ================================
-    // 📄 XỬ LÝ 1 CHƯƠNG + COMMENT
-    // ================================
-    static async Task ProcessChapter(
-    string url,
-    ObjectId storyId,
-    IMongoCollection<BsonDocument> chaptersCol) // Bỏ tham số commentsCol
-    {
-        using var client = new HttpClient();
-        client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
-
         try
         {
-            if (await chaptersCol.Find(Builders<BsonDocument>.Filter.Eq("url", url)).AnyAsync()) return;
-
+            // 1. Tải HTML Chương (Để lấy nội dung)
             string html = await client.GetStringAsync(url);
             var doc = new HtmlDocument();
             doc.LoadHtml(html);
 
-            string chapterTitle = doc.DocumentNode.SelectSingleNode("//h1")?.InnerText.Trim() ?? "Unknown";
-            var contentNode = doc.DocumentNode.SelectSingleNode("//div[contains(@class, 'chapter-content')]");
+            // 2. Lưu Nội dung chương
+            ObjectId chapterId = ObjectId.GenerateNewId();
+            var existingChap = await chaptersCol.Find(Builders<BsonDocument>.Filter.Eq("url", url)).FirstOrDefaultAsync();
 
-            if (contentNode == null) return;
+            if (existingChap != null)
+            {
+                chapterId = existingChap["_id"].AsObjectId;
+            }
+            else
+            {
+                string chapterTitle = System.Net.WebUtility.HtmlDecode(doc.DocumentNode.SelectSingleNode("//h1")?.InnerText.Trim() ?? "Unknown");
+                var contentNode = doc.DocumentNode.SelectSingleNode("//div[contains(@class, 'chapter-content')]");
 
-            // Clean rác
-            foreach (var n in contentNode.SelectNodes("//script|//style|//div[contains(@class,'w-full')]") ?? new HtmlNodeCollection(null)) n.Remove();
-            foreach (var br in contentNode.SelectNodes("//br") ?? new HtmlNodeCollection(null)) br.ParentNode.ReplaceChild(doc.CreateTextNode("\n"), br);
+                if (contentNode != null)
+                {
+                    foreach (var n in contentNode.SelectNodes("//script|//style|//div[contains(@class,'w-full')]") ?? new HtmlNodeCollection(null)) n.Remove();
+                    foreach (var br in contentNode.SelectNodes("//br") ?? new HtmlNodeCollection(null)) br.ParentNode.ReplaceChild(doc.CreateTextNode("\n"), br);
+                    string content = System.Net.WebUtility.HtmlDecode(contentNode.InnerText.Trim());
 
-            string content = System.Net.WebUtility.HtmlDecode(contentNode.InnerText.Trim());
+                    var chapterDoc = new BsonDocument {
+                        { "_id", chapterId }, { "story_id", storyId }, { "chapter_title", chapterTitle },
+                        { "content", content }, { "url", url }, { "source", "RoyalRoad" }, { "crawled_at", DateTime.UtcNow }
+                    };
+                    await chaptersCol.InsertOneAsync(chapterDoc);
+                }
+            }
 
-            var chapterDoc = new BsonDocument
-        {
-            { "story_id", storyId },
-            { "chapter_title", chapterTitle },
-            { "content", content },
-            { "url", url },
-            { "source", "RoyalRoad" },
-            { "crawled_at", DateTime.UtcNow }
-        };
-            await chaptersCol.InsertOneAsync(chapterDoc);
+            // 3. 🟢 GỌI CÀO COMMENT (Dùng link gốc để trích ID)
+            await ScrapeChapterComments(client, url, storyId, chapterId, commentsCol);
         }
-        catch { /* Ignore errors */ }
+        catch { }
     }
 
-    static async Task ScrapeStoryReviews(
-    string storyUrl,
-    ObjectId storyId,
-    IMongoCollection<BsonDocument> commentsCol)
+    // =========================================================
+    // 💬 HÀM CÀO COMMENT (FIX API + LIMIT 7)
+    // =========================================================
+    static async Task ScrapeChapterComments(HttpClient client, string chapterUrl, ObjectId storyId, ObjectId chapterId, IMongoCollection<BsonDocument> commentsCol)
     {
-        // 1. Làm sạch URL (Xóa hết các đuôi ?reviews=... cũ nếu user lỡ copy thừa)
-        string baseUrl = storyUrl.Split('?')[0];
+        // 1. Lấy ID thật của chương từ URL
+        var match = Regex.Match(chapterUrl, @"chapter/(\d+)");
+        if (!match.Success) return;
+        string realChapterId = match.Groups[1].Value;
 
         int page = 1;
-        int totalWanted = 50; // 🎯 CẤU HÌNH: Muốn lấy 50 review
-        int totalCollected = 0;
+        bool hasNextPage = true;
+        int totalSaved = 0;
+        int MAX_COMMENTS = 7; // 🎯 GIỚI HẠN 7 COMMENT
 
-        using var client = new HttpClient();
-        client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        // Giả lập trình duyệt xịn để không bị chặn
+        if (!client.DefaultRequestHeaders.Contains("User-Agent"))
+            client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
-        Console.WriteLine($"\n⭐ Bắt đầu quét Review (Mục tiêu: {totalWanted})...");
-
-        while (totalCollected < totalWanted)
+        while (hasNextPage && totalSaved < MAX_COMMENTS)
         {
-            // 2. TỰ ĐỘNG TẠO LINK TRANG
-            // Trang 1 thì giữ nguyên, Trang > 1 thì thêm ?reviews=số_trang
-            string currentUrl = (page == 1) ? baseUrl : $"{baseUrl}?reviews={page}";
+            // Gọi đường dẫn API trực tiếp
+            string ajaxUrl = $"https://www.royalroad.com/fiction/chapter/{realChapterId}/comments/{page}";
 
             try
             {
-                Console.WriteLine($"   -> Đang quét trang {page}: {currentUrl}");
-                string html = await client.GetStringAsync(currentUrl);
+                string html = await client.GetStringAsync(ajaxUrl);
                 var doc = new HtmlDocument();
                 doc.LoadHtml(html);
 
-                // XPath lấy list review
-                var reviewNodes = doc.DocumentNode.SelectNodes("//div[contains(@class, 'reviews-container')]//div[contains(@class, 'review')]");
+                var commentNodes = doc.DocumentNode.SelectNodes("//div[contains(@class, 'comment')]");
 
-                // 3. ĐIỀU KIỆN DỪNG: Nếu trang này không còn review nào -> Hết truyện -> Dừng lại
-                if (reviewNodes == null || reviewNodes.Count == 0)
+                if (commentNodes == null || commentNodes.Count == 0)
                 {
-                    Console.WriteLine("   ⚠️ Đã hết review (Trang cuối).");
+                    hasNextPage = false;
                     break;
                 }
 
                 var bulkOps = new List<WriteModel<BsonDocument>>();
 
-                foreach (var node in reviewNodes)
+                foreach (var node in commentNodes)
                 {
-                    if (totalCollected >= totalWanted) break;
-
-                    // --- Bóc tách dữ liệu (Giữ nguyên) ---
-                    var contentDiv = node.SelectSingleNode(".//div[contains(@class, 'review-content')]");
-                    string content = contentDiv != null ? System.Net.WebUtility.HtmlDecode(contentDiv.InnerText.Trim()) : "";
-                    if (string.IsNullOrEmpty(content)) continue;
-
-                    double rating = 0;
-                    var starNode = node.SelectSingleNode(".//*[contains(@aria-label, 'stars')]");
-                    if (starNode != null)
+                    // Kiểm tra nếu đã đủ 7 comment thì dừng ngay
+                    if (totalSaved >= MAX_COMMENTS)
                     {
-                        string starText = starNode.GetAttributeValue("aria-label", "0");
-                        double.TryParse(starText.Split(' ')[0], out rating);
+                        hasNextPage = false;
+                        break;
                     }
 
-                    var userNode = node.SelectSingleNode(".//div[contains(@class, 'review-meta')]//a") ?? node.SelectSingleNode(".//h4//a");
-                    string username = userNode?.InnerText.Trim() ?? "Anonymous";
+                    try
+                    {
+                        var userNode = node.SelectSingleNode(".//h4//span[@class='name']//a") ?? node.SelectSingleNode(".//a[contains(@href, '/profile/')]");
+                        string user = System.Net.WebUtility.HtmlDecode(userNode?.InnerText.Trim() ?? "Guest");
 
-                    var titleNode = node.SelectSingleNode(".//h4") ?? node.SelectSingleNode(".//div[contains(@class, 'review-title')]");
-                    string reviewTitle = titleNode?.InnerText.Trim() ?? "";
+                        var contentNode = node.SelectSingleNode(".//div[contains(@class, 'comment-body')]");
+                        // Xóa các nút thừa trong nội dung
+                        var actions = contentNode?.SelectSingleNode(".//div[@class='comment-actions']");
+                        if (actions != null) actions.Remove();
 
-                    // Filter chống trùng
-                    var filter = Builders<BsonDocument>.Filter.And(
-                        Builders<BsonDocument>.Filter.Eq("story_id", storyId),
-                        Builders<BsonDocument>.Filter.Eq("reviewer", username)
-                    );
+                        string content = contentNode != null ? System.Net.WebUtility.HtmlDecode(contentNode.InnerText.Trim()) : "";
+                        if (string.IsNullOrEmpty(content)) continue;
 
-                    var updateDoc = new BsonDocument
-                {
-                    { "$set", new BsonDocument {
-                        { "rating", rating },
-                        { "review_title", reviewTitle },
-                        { "comment_text", content },
-                        { "source_url", currentUrl },
-                        { "type", "StoryReview" },
-                        { "updated_at", DateTime.UtcNow }
-                    }},
-                    { "$setOnInsert", new BsonDocument { { "created_at", DateTime.UtcNow } } }
-                };
+                        var timeNode = node.SelectSingleNode(".//time[@unixtime]");
+                        DateTime commentDate = DateTime.UtcNow;
+                        if (timeNode != null && long.TryParse(timeNode.GetAttributeValue("unixtime", ""), out long unixTime))
+                        {
+                            commentDate = DateTimeOffset.FromUnixTimeSeconds(unixTime).DateTime;
+                        }
 
-                    bulkOps.Add(new UpdateOneModel<BsonDocument>(filter, updateDoc) { IsUpsert = true });
-                    totalCollected++;
+                        // Filter Upsert
+                        var filter = Builders<BsonDocument>.Filter.And(
+                            Builders<BsonDocument>.Filter.Eq("chapter_id", chapterId),
+                            Builders<BsonDocument>.Filter.Eq("user", user),
+                            Builders<BsonDocument>.Filter.Eq("comment_date", commentDate)
+                        );
+
+                        var commentDoc = new BsonDocument {
+                            { "$set", new BsonDocument {
+                                { "story_id", storyId }, { "chapter_id", chapterId }, { "user", user },
+                                { "content", content }, { "comment_date", commentDate },
+                                { "source_url", chapterUrl }, { "type", "ChapterComment" }, { "crawled_at", DateTime.UtcNow }
+                            }},
+                            { "$setOnInsert", new BsonDocument { { "created_at", DateTime.UtcNow } } }
+                        };
+                        bulkOps.Add(new UpdateOneModel<BsonDocument>(filter, commentDoc) { IsUpsert = true });
+
+                        // Tăng biến đếm sau khi thêm vào danh sách chờ lưu
+                        totalSaved++;
+                    }
+                    catch { }
                 }
 
-                // Ghi vào DB
                 if (bulkOps.Count > 0)
                 {
                     await commentsCol.BulkWriteAsync(bulkOps);
                 }
 
-                // 4. CHUẨN BỊ CHO VÒNG LẶP TIẾP THEO
-                page++; // Tăng số trang lên (1 -> 2 -> 3...)
-                await Task.Delay(1000); // Nghỉ 1 giây để không bị chặn
+                // Nếu vẫn chưa đủ 7 comment, tìm trang tiếp theo
+                if (totalSaved < MAX_COMMENTS)
+                {
+                    var nextPage = doc.DocumentNode.SelectSingleNode($"//ul[contains(@class, 'pagination')]//a[contains(@href, 'comments={page + 1}')]");
+                    if (nextPage != null)
+                    {
+                        page++;
+                        await Task.Delay(500);
+                    }
+                    else hasNextPage = false;
+                }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"❌ Lỗi tại trang {page}: {ex.Message}");
-                break;
-            }
+            catch { hasNextPage = false; }
         }
-
-        Console.WriteLine($"✅ Hoàn tất! Đã lưu tổng cộng {totalCollected} review.");
     }
 
+    // =========================================================
+    // 📘 HÀM LẤY INFO, STATS, REVIEW (CODE CŨ VẪN CHUẨN)
+    // =========================================================
+    static async Task<(string Title, string Author, List<string> Genres, List<string> Links)> GetStoryInfo(string tocUrl)
+    {
+        string title = "Unknown"; string author = "Unknown"; var genres = new List<string>(); var links = new List<string>();
+        using var client = new HttpClient(); client.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
+        string html = await client.GetStringAsync(tocUrl); var doc = new HtmlDocument(); doc.LoadHtml(html);
 
+        title = doc.DocumentNode.SelectSingleNode("//h1")?.InnerText.Trim() ?? "Unknown";
+        var authorNode = doc.DocumentNode.SelectSingleNode("//h4//a[contains(@href, '/profile/')]");
+        if (authorNode != null) author = authorNode.InnerText.Trim();
+        else { var meta = doc.DocumentNode.SelectSingleNode("//meta[@property='books:author']"); if (meta != null) author = meta.GetAttributeValue("content", "Unknown"); }
 
+        var genreNodes = doc.DocumentNode.SelectNodes("//span[contains(@class, 'tags')]//a");
+        if (genreNodes != null) genres.AddRange(genreNodes.Select(g => System.Net.WebUtility.HtmlDecode(g.InnerText.Trim())));
+
+        var linkNodes = doc.DocumentNode.SelectNodes("//table[@id='chapters']//td[1]/a[@href]");
+        if (linkNodes != null) foreach (var n in linkNodes) links.Add("https://www.royalroad.com" + n.GetAttributeValue("href", ""));
+
+        return (title, author, genres.Distinct().ToList(), links.Distinct().ToList());
+    }
+
+    static BsonDocument GetStoryStatistics(HtmlDocument doc)
+    {
+        var s = new BsonDocument();
+        try
+        {
+            var c = doc.DocumentNode.SelectSingleNode("//div[contains(@class, 'stats-content')]") ?? doc.DocumentNode.SelectSingleNode("//div[contains(@class, 'portlet-body') and .//li[contains(text(), 'Total Views')]]");
+            if (c == null) return s;
+            s.Add("total_views", GetStatNumber(c, "Total Views")); s.Add("followers", GetStatNumber(c, "Followers"));
+            s.Add("favorites", GetStatNumber(c, "Favorites")); s.Add("rating_count", GetStatNumber(c, "Ratings"));
+            s.Add("overall_score", GetStatScore(c, "Overall Score")); s.Add("style_score", GetStatScore(c, "Style Score"));
+            s.Add("story_score", GetStatScore(c, "Story Score")); s.Add("grammar_score", GetStatScore(c, "Grammar Score"));
+            s.Add("character_score", GetStatScore(c, "Character Score"));
+        }
+        catch { }
+        return s;
+    }
+    static int GetStatNumber(HtmlNode c, string l) { try { var n = c.SelectSingleNode($".//li[contains(., '{l}')]/following-sibling::li[1]"); if (n != null) return int.Parse(Regex.Match(n.InnerText.Replace(",", ""), @"\d+").Value); } catch { } return 0; }
+    static double GetStatScore(HtmlNode c, string l) { try { var n = c.SelectSingleNode($".//li[contains(., '{l}')]/following-sibling::li[1]//span"); if (n != null) { string str = (n.GetAttributeValue("data-content", "") + n.GetAttributeValue("aria-label", "")).Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries)[0]; if (double.TryParse(str, NumberStyles.Any, CultureInfo.InvariantCulture, out double r)) return r; } } catch { } return 0.0; }
+
+    static async Task ScrapeStoryReviews(string u, ObjectId sId, IMongoCollection<BsonDocument> col)
+    {
+        int p = 1; int got = 0; using var c = new HttpClient(); c.DefaultRequestHeaders.Add("User-Agent", "Mozilla/5.0");
+        Console.WriteLine($"\n⭐ Đang quét Review (Mục tiêu 50)...");
+        while (got < 50)
+        {
+            try
+            {
+                string h = await c.GetStringAsync($"{u.Split('?')[0]}?reviews={p}"); var d = new HtmlDocument(); d.LoadHtml(h);
+                var ns = d.DocumentNode.SelectNodes("//div[contains(@class, 'review') and @id]"); if (ns == null) break;
+                var ops = new List<WriteModel<BsonDocument>>();
+                foreach (var n in ns)
+                {
+                    if (got >= 50) break;
+                    string usr = System.Net.WebUtility.HtmlDecode(n.SelectSingleNode(".//div[contains(@class, 'review-meta')]//a")?.InnerText.Trim() ?? "Anon");
+                    string txt = System.Net.WebUtility.HtmlDecode(n.SelectSingleNode(".//div[contains(@class, 'review-content')]")?.InnerText.Trim() ?? "");
+                    if (string.IsNullOrEmpty(txt)) continue;
+
+                    var scoreNode = n.SelectSingleNode(".//div[contains(@class, 'scores')]");
+                    double rate = GetReviewScore(scoreNode, "Overall");
+
+                    var filter = Builders<BsonDocument>.Filter.And(Builders<BsonDocument>.Filter.Eq("story_id", sId), Builders<BsonDocument>.Filter.Eq("reviewer", usr));
+                    var doc = new BsonDocument { { "$set", new BsonDocument { { "rating", rate }, { "comment_text", txt }, { "reviewer", usr }, { "type", "StoryReview" } } } };
+                    ops.Add(new UpdateOneModel<BsonDocument>(filter, doc) { IsUpsert = true }); got++;
+                }
+                if (ops.Count > 0) await col.BulkWriteAsync(ops); p++; await Task.Delay(1000);
+            }
+            catch { break; }
+        }
+        Console.WriteLine($"   -> Xong review: {got}");
+    }
+    static double GetReviewScore(HtmlNode c, string l) { try { var n = c.SelectSingleNode($".//*[contains(text(), '{l}')]/following-sibling::*[contains(@aria-label, 'stars')][1]") ?? c.SelectSingleNode($".//*[contains(@aria-label, 'stars')]"); if (n != null && double.TryParse(n.GetAttributeValue("aria-label", "0").Split(' ')[0], NumberStyles.Any, CultureInfo.InvariantCulture, out double r)) return r; } catch { } return 0; }
 }
